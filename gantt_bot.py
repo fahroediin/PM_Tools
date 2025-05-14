@@ -5,114 +5,80 @@ import pandas as pd
 import matplotlib.pyplot as plt
 from matplotlib.patches import Patch
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
-from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, ContextTypes
+from telegram.ext import ApplicationBuilder, CommandHandler, CallbackQueryHandler, MessageHandler, filters, ContextTypes
 from bs4 import BeautifulSoup
 from datetime import datetime
 from dotenv import load_dotenv
 from openpyxl import Workbook
 
+# ------------------ CONFIGURATION ------------------
 load_dotenv()
-
-MIRO_TOKEN = os.getenv("MIRO_TOKEN")
-BOARD_ID = os.getenv("BOARD_ID")
 TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 
-headers = {
-    "Authorization": f"Bearer {MIRO_TOKEN}"
-}
-
+# ------------------ LOGGER SETUP ------------------
 logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-def fetch_sticky_notes():
-    url = f"https://api.miro.com/v2/boards/{BOARD_ID}/items?type=sticky_note"
+# ------------------ FETCHING DATA ------------------
+def fetch_sticky_notes(board_id, headers):
+    url = f"https://api.miro.com/v2/boards/{board_id}/items?type=sticky_note"
     response = requests.get(url, headers=headers)
     if response.status_code == 200:
-        return response.json()["data"]
-    else:
-        logging.error(f"Gagal ambil data dari Miro: {response.status_code} {response.text}")
-        return []
+        return response.json().get("data", [])
+    logger.error(f"Gagal ambil data dari Miro: {response.status_code} {response.text}")
+    return []
 
 def parse_note(note):
     try:
-        content = note["data"]["content"]
-        style = note.get("style", {})
-        color = style.get("fillColor", "")
-
-        clean_content = BeautifulSoup(content, "lxml").get_text()
-
-        if "|" not in clean_content:
-            return None
-
-        parts = [part.strip() for part in clean_content.split("|")]
+        content = note["data"].get("content", "")
+        color = note.get("style", {}).get("fillColor", "")
+        clean = BeautifulSoup(content, "lxml").get_text()
+        parts = [x.strip() for x in clean.split("|")]
         if len(parts) != 4:
             return None
-
-        task, start, end, person = parts
-
-        return {
-            "Task": task,
-            "Start": start,
-            "End": end,
-            "Person": person,
-            "Type": "Pending"
-        }
+        return dict(zip(["Task", "Start", "End", "Person"], parts))
     except Exception as e:
-        logging.warning(f"Gagal parsing note: {e}")
+        logger.warning(f"Parse error: {e}")
         return None
 
-def generate_excel_gantt(data, image_path="gantt_chart_styled.png", excel_path="gantt_chart_styled.xlsx"):
+# ------------------ CHART GENERATION ------------------
+def generate_chart(data, image_path, excel_path, chart_type="gantt"):
     df = pd.DataFrame(data)
     df["Start"] = pd.to_datetime(df["Start"])
     df["End"] = pd.to_datetime(df["End"])
     df["Duration"] = (df["End"] - df["Start"]).dt.days
 
-    colors = {"Critical Path": "#FF0000", "Floating Task": "#1E90FF", "Pending": "#808080"}
-
-    start_min = df["Start"].min()
-    end_max = df["End"].max()
+    colors = {"Critical Path": "#FF0000", "Floating Task": "#1E90FF"}
+    start_min, end_max = df["Start"].min(), df["End"].max()
     total_days = (end_max - start_min).days + 1
 
-    width_per_day = 0.3
-    height_per_task = 0.5
-    fig_width = max(10, total_days * width_per_day)
-    fig_height = max(6, len(df) * height_per_task)
-
-    fig, ax = plt.subplots(figsize=(fig_width, fig_height))
-    yticks = []
-    ylabels = []
+    fig, ax = plt.subplots(figsize=(max(10, total_days * 0.3), max(6, len(df) * 0.5)))
+    yticks, ylabels = [], []
 
     for i, row in df.iterrows():
-        ax.barh(
-            y=i,
-            width=row["Duration"],
-            left=row["Start"],
-            color=colors.get(row["Type"], "gray"),
-            edgecolor="black"
-        )
-        ax.text(
-            row["End"] + pd.Timedelta(days=1),
-            i,
-            row["Person"],
-            va="center",
-            fontsize=9,
-            color="black"
-        )
+        left = row["Start"] if chart_type == "gantt" else i
+        width = row["Duration"] if chart_type == "gantt" else 0.8
+        color = colors.get(row.get("Type"), "#999999")
+
+        ax.barh(i, width, left=left, color=color, edgecolor="black")
+        ax.text(row["End"] + pd.Timedelta(days=1) if chart_type == "gantt" else i + 0.4, i, row["Person"],
+                va="center", fontsize=9)
         yticks.append(i)
         ylabels.append(row["Task"])
 
     ax.set_yticks(yticks)
     ax.set_yticklabels(ylabels)
     ax.set_xlabel("Timeline")
-    ax.set_title("GANTT CHART")
-    ax.grid(True, axis='x', which='both', linestyle='--', linewidth=0.5)
+    ax.set_title(chart_type.upper())
+    ax.grid(True, axis='x', linestyle='--', linewidth=0.5)
     ax.invert_yaxis()
 
-    ax.set_xlim(start_min - pd.Timedelta(days=1), end_max + pd.Timedelta(days=2))
-    ax.xaxis.set_major_locator(plt.MaxNLocator(integer=True))
-    fig.autofmt_xdate(rotation=45)
+    if chart_type == "gantt":
+        ax.set_xlim(start_min - pd.Timedelta(days=1), end_max + pd.Timedelta(days=2))
+        fig.autofmt_xdate(rotation=45)
 
-    legend_elements = [Patch(facecolor=color, edgecolor='black', label=label) for label, color in colors.items()]
-    ax.legend(handles=legend_elements, loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3)
+    ax.legend(handles=[Patch(facecolor=c, edgecolor='black', label=l) for l, c in colors.items()],
+              loc='upper center', bbox_to_anchor=(0.5, -0.15), ncol=3)
 
     plt.tight_layout()
     plt.savefig(image_path)
@@ -127,139 +93,165 @@ def generate_excel_gantt(data, image_path="gantt_chart_styled.png", excel_path="
 
     return image_path, excel_path
 
+# ------------------ TELEGRAM BOT HANDLERS ------------------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Halo! 👋\nGunakan perintah /gantt untuk mulai membuat Gantt Chart dari sticky notes Miro.")
+    await update.message.reply_text("Halo! Kirimkan *Miro Token* kamu terlebih dahulu:", parse_mode="Markdown")
 
-async def send_gantt(update_or_query, context: ContextTypes.DEFAULT_TYPE):
-    if isinstance(update_or_query, Update):
-        chat = update_or_query.message
-    else:
-        chat = update_or_query.message
+async def handle_text_input(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    text = update.message.text.strip()
+    if "miro_token" not in context.user_data:
+        context.user_data["miro_token"] = text
+        context.user_data["headers"] = {"Authorization": f"Bearer {text}"}
+        await update.message.reply_text("✅ Miro Token disimpan.\nSekarang, kirimkan *Board ID* kamu:")
+    elif "board_id" not in context.user_data:
+        context.user_data["board_id"] = text
+        await update.message.reply_text("✅ Board ID disimpan.\nSekarang, kamu bisa jalankan perintah /gantt.")
 
-    if "parsed_notes" not in context.user_data:
-        notes = fetch_sticky_notes()
-        parsed = [parse_note(n) for n in notes if parse_note(n)]
-        if not parsed:
-            await chat.reply_text("❌ Tidak ada sticky notes yang bisa diproses.")
-            return
+async def send_gantt(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    headers = context.user_data.get("headers")
+    board_id = context.user_data.get("board_id")
+    if not headers or not board_id:
+        await update.message.reply_text("❗ Kamu belum mengirimkan Miro Token atau Board ID. Gunakan /start.")
+        return
 
-        context.user_data["parsed_notes"] = parsed
+    notes_raw = fetch_sticky_notes(board_id, headers)
+    notes = [parse_note(n) for n in notes_raw if parse_note(n)]
+    if not notes:
+        await update.message.reply_text("❌ Tidak ada sticky notes yang valid ditemukan.")
+        return
 
-    context.user_data["selected_tasks"] = context.user_data.get("selected_tasks", {"Critical Path": set(), "Floating Task": set()})
-    context.user_data["current_type"] = context.user_data.get("current_type", None)
+    context.user_data["parsed_notes"] = notes
+    context.user_data["selected_tasks"] = {"Critical Path": set(), "Floating Task": set()}
+    context.user_data["current_type"] = "Critical Path"
 
-    keyboard = [
-        [InlineKeyboardButton("🔴 Pilih Critical Path", callback_data="set_type_critical")],
-        [InlineKeyboardButton("🔵 Pilih Floating Task", callback_data="set_type_floating")]
-    ]
+    await update.message.reply_text(
+        "✅ Data berhasil dimuat.\n\nSilakan pilih task berdasarkan kategori *Critical Path* atau *Floating Task*.",
+    parse_mode="Markdown"
+    )
 
-    if any(len(tasks) > 0 for tasks in context.user_data["selected_tasks"].values()):
-        keyboard.append([InlineKeyboardButton("✅ Generate Gantt Chart", callback_data="generate_gantt")])
+    # Panggil handle_buttons secara langsung tanpa perlu tombol
+    class FakeQuery:
+        def __init__(self, message):
+            self.data = ""
+            self.message = message
+        async def answer(self, *args, **kwargs):
+            pass
+        async def edit_message_text(self, text, reply_markup=None, **kwargs):
+            await self.message.reply_text(text, reply_markup=reply_markup, **kwargs)
 
-    await chat.reply_text("Pilih tipe task yang ingin diklasifikasikan:", reply_markup=InlineKeyboardMarkup(keyboard))
+    fake_update = Update(update.update_id, callback_query=FakeQuery(update.message))
+    await handle_buttons(fake_update, context)
 
 async def handle_buttons(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
     await query.answer()
     data = query.data
-    parsed_notes = context.user_data.get("parsed_notes", [])
-    selected_tasks = context.user_data.get("selected_tasks", {})
 
-    if data == "noop":
+    notes = context.user_data.get("parsed_notes", [])
+    selected = context.user_data.get("selected_tasks", {})
+    tipe = context.user_data.get("current_type")
+
+    if data in ["set_type_critical", "set_type_floating"]:
+        tipe = "Critical Path" if data == "set_type_critical" else "Floating Task"
+        context.user_data["current_type"] = tipe
+
+    elif data == "reset_all":
+        selected["Critical Path"].clear()
+        selected["Floating Task"].clear()
+        await query.message.reply_text("🔁 Semua pilihan task telah dibatalkan.")
         return
 
-    if data == "set_type_critical":
-        context.user_data["current_type"] = "Critical Path"
-    elif data == "set_type_floating":
-        context.user_data["current_type"] = "Floating Task"
     elif data == "done_selecting":
-        await query.message.reply_text("✅ Pemilihan task selesai. Kamu bisa memilih tipe task lain atau generate Gantt Chart.")
-        await send_gantt(query, context)
+        summary = [f"*{t}*\n" + "\n".join(f"• {notes[i]['Task']}" for i in ids) if ids else f"*{t}*\n(tidak ada)"
+                   for t, ids in selected.items()]
+        await query.message.reply_text("📋 *Ringkasan task yang dipilih:*\n\n" + "\n\n".join(summary), parse_mode="Markdown")
+        keyboard = [[InlineKeyboardButton("✅ Generate Chart", callback_data="generate_chart")]]
+        await query.message.reply_text("Lanjutkan ke pembuatan chart:", reply_markup=InlineKeyboardMarkup(keyboard))
         return
-    elif data == "generate_gantt":
+
+    elif data.startswith("toggle_"):
+        idx = int(data.split("_")[1])
+        if not tipe:
+            await query.answer("Pilih tipe task dulu!", show_alert=True)
+            return
+
+        other = "Floating Task" if tipe == "Critical Path" else "Critical Path"
+        if idx in selected[other]:
+            await query.answer("Task sudah dipilih di tipe lain!", show_alert=True)
+            return
+
+        if idx in selected[tipe]:
+            selected[tipe].remove(idx)
+        else:
+            selected[tipe].add(idx)
+
+    elif data == "generate_chart":
+        context.user_data["chart_type"] = "gantt"
+        keyboard = [[InlineKeyboardButton("📊 Gantt Chart", callback_data="chart_gantt")],
+                    [InlineKeyboardButton("📅 Timeline", callback_data="chart_timeline")]]
+        await query.message.reply_text("Pilih jenis chart:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    elif data.startswith("chart_"):
+        context.user_data["chart_type"] = data.split("_")[1]
+        keyboard = [[InlineKeyboardButton("🖼 PNG", callback_data="format_png")],
+                    [InlineKeyboardButton("📄 Excel", callback_data="format_excel")]]
+        await query.message.reply_text("Pilih format output:", reply_markup=InlineKeyboardMarkup(keyboard))
+        return
+
+    elif data.startswith("format_"):
+        chart_type = context.user_data.get("chart_type", "gantt")
         selected_notes = []
-        for tipe, indices in selected_tasks.items():
-            for idx in indices:
-                note = parsed_notes[idx].copy()
+        for tipe, ids in selected.items():
+            for idx in ids:
+                note = notes[idx].copy()
                 note["Type"] = tipe
                 selected_notes.append(note)
 
         if not selected_notes:
-            await query.message.reply_text("⚠️ Belum ada task yang dipilih.")
+            await query.message.reply_text("❗ Belum ada task yang dipilih.")
             return
 
-        keyboard = [
-            [InlineKeyboardButton("📊 PNG", callback_data="generate_png")],
-            [InlineKeyboardButton("📊 Excel", callback_data="generate_excel")]
-        ]
-
-        await query.edit_message_text("Pilih format untuk Gantt Chart:", reply_markup=InlineKeyboardMarkup(keyboard))
-        context.user_data["selected_notes"] = selected_notes
+        image, excel = generate_chart(selected_notes, f"chart_{chart_type}.png", f"chart_{chart_type}.xlsx", chart_type)
+        if data.endswith("png"):
+            await query.message.reply_photo(open(image, "rb"), caption=f"{chart_type.upper()} Chart (PNG)")
+        if data.endswith("excel"):
+            await query.message.reply_document(open(excel, "rb"), filename=excel)
         return
-    elif data == "generate_png" or data == "generate_excel":
-        selected_notes = context.user_data.get("selected_notes", [])
 
-        if not selected_notes:
-            await query.message.reply_text("⚠️ Belum ada data yang dipilih.")
-            return
-
-        png_file, excel_file = generate_excel_gantt(selected_notes)
-        await query.message.reply_photo(photo=open(png_file, 'rb'), caption="📊 Gantt Chart (PNG)")
-
-        if data == "generate_excel":
-            await query.message.reply_document(document=open(excel_file, 'rb'), filename="gantt_chart_styled.xlsx")
-
-        await query.edit_message_text("Gantt Chart telah dibuat dan dikirimkan. Terima kasih!")
-        return
-    elif data.startswith("toggle_"):
-        idx = int(data.split("_")[1])
-        current_type = context.user_data["current_type"]
-        if current_type is None:
-            await query.edit_message_text("⚠️ Harap pilih tipe task terlebih dahulu.")
-            return
-
-        other_type = "Floating Task" if current_type == "Critical Path" else "Critical Path"
-        if idx in selected_tasks[other_type]:
-            await query.answer(f"❌ Task ini sudah dipilih sebagai {other_type}.", show_alert=True)
-            return
-
-        if idx in selected_tasks[current_type]:
-            selected_tasks[current_type].remove(idx)
-        else:
-            selected_tasks[current_type].add(idx)
-
-        context.user_data["selected_tasks"] = selected_tasks
-
-    current_type = context.user_data.get("current_type", "")
+    # Show updated task selection
+    current = context.user_data.get("current_type", "Critical Path")
     keyboard = []
-    for idx, note in enumerate(parsed_notes):
+    for idx, note in enumerate(notes):
         label = note["Task"]
-        selected_in_current = idx in selected_tasks[current_type]
-        selected_in_other = idx in selected_tasks["Floating Task" if current_type == "Critical Path" else "Critical Path"]
+        if idx in selected["Critical Path"]:
+            label = "🔴 " + label
+        elif idx in selected["Floating Task"]:
+            label = "🔵 " + label
 
-        if selected_in_other:
-            label = f"❌ {label} (sudah dipilih)"
-            button = InlineKeyboardButton(label, callback_data="noop")
+        if idx in selected["Critical Path"] and current == "Floating Task" or \
+           idx in selected["Floating Task"] and current == "Critical Path":
+            button = InlineKeyboardButton(f"❌ {label}", callback_data="noop")
         else:
-            prefix = "✅ " if selected_in_current else ""
-            button = InlineKeyboardButton(f"{prefix}{label}", callback_data=f"toggle_{idx}")
-
+            button = InlineKeyboardButton(label, callback_data=f"toggle_{idx}")
         keyboard.append([button])
 
-    keyboard.append([InlineKeyboardButton("✔️ Selesai Memilih", callback_data="done_selecting")])
+    keyboard += [[InlineKeyboardButton("✔️ Selesai", callback_data="done_selecting"),
+                  InlineKeyboardButton("🔁 Reset", callback_data="reset_all")],
+                 [InlineKeyboardButton("🔴 Critical", callback_data="set_type_critical"),
+                  InlineKeyboardButton("🔵 Floating", callback_data="set_type_floating")]]
+    await query.edit_message_text("Pilih task yang termasuk dalam kategori: *" + current + "*", reply_markup=InlineKeyboardMarkup(keyboard))
 
-    await query.edit_message_text(
-        f"Klik task untuk memilih sebagai *{current_type}*: ",
-        reply_markup=InlineKeyboardMarkup(keyboard),
-        parse_mode="Markdown"
-    )
-
+# ------------------ MAIN FUNCTION ------------------
 def main():
-    app = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
-    app.add_handler(CommandHandler("start", start))
-    app.add_handler(CommandHandler("gantt", send_gantt))
-    app.add_handler(CallbackQueryHandler(handle_buttons))
-    app.run_polling()
+    application = ApplicationBuilder().token(TELEGRAM_TOKEN).build()
+
+    application.add_handler(CommandHandler("start", start))
+    application.add_handler(CommandHandler("gantt", send_gantt))
+    application.add_handler(CallbackQueryHandler(handle_buttons))
+    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_text_input))
+
+    application.run_polling()
 
 if __name__ == "__main__":
     main()
